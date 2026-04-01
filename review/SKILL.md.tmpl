@@ -211,7 +211,138 @@ If no documentation files exist, skip this step silently.
 
 ---
 
-{{ADVERSARIAL_STEP}}
+## Step 5.7: Adversarial review (always-on, parallelized)
+
+Every diff gets adversarial review from both Claude and Codex. LOC is not a proxy for risk —
+a 5-line auth change can be critical. ALL passes run in PARALLEL for speed.
+
+**Detect diff size and tool availability:**
+
+```bash
+DIFF_INS=$(git diff origin/<base> --stat | tail -1 | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0")
+DIFF_DEL=$(git diff origin/<base> --stat | tail -1 | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo "0")
+DIFF_TOTAL=$((DIFF_INS + DIFF_DEL))
+CODEX_PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | tail -1)
+which codex 2>/dev/null && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
+echo "DIFF_SIZE: $DIFF_TOTAL"
+echo "PLUGIN_ROOT: ${CODEX_PLUGIN_ROOT:-not_found}"
+```
+
+---
+
+### PARALLEL DISPATCH — launch all passes simultaneously
+
+Launch ALL of the following in parallel using the Agent tool. Each runs as an independent
+subagent with fresh context. Collect all results before proceeding to synthesis.
+
+**Pass 1: Claude adversarial subagent** (always runs)
+
+```
+Agent tool call:
+  subagent_type: "general-purpose"
+  description: "Claude adversarial review"
+  prompt: |
+    Read the diff for this branch with `git diff origin/<base>`.
+    Think like an attacker and a chaos engineer. Your job is to find ways this
+    code will fail in production. Look for: edge cases, race conditions, security
+    holes, resource leaks, failure modes, silent data corruption, logic errors
+    that produce wrong results silently, error handling that swallows failures,
+    and trust boundary violations. Be adversarial. Be thorough. No compliments —
+    just the problems. For each finding, classify as FIXABLE (you know how to fix
+    it) or INVESTIGATE (needs human judgment).
+```
+
+**Pass 2: Codex adversarial-review** (runs when Codex is available)
+
+Use the codex plugin's adversarial-review command for a steerable challenge review.
+This uses the plugin's structured output schema with severity levels and file references.
+
+```bash
+CODEX_PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | tail -1)
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+
+node "$CODEX_PLUGIN_ROOT/scripts/codex-companion.mjs" adversarial-review \
+  --base <base> \
+  --wait \
+  2>&1
+```
+
+Set the Bash tool's `timeout` parameter to `300000` (5 minutes). The adversarial-review
+command returns structured findings with severity, file, line, confidence, and
+recommendations. Present the full output verbatim.
+
+**Pass 3: Codex structured code review** (runs when Codex available AND diff >= 200 lines)
+
+Use the codex plugin's review command for a standard code review with pass/fail gate.
+
+```bash
+node "$CODEX_PLUGIN_ROOT/scripts/codex-companion.mjs" review \
+  --base <base> \
+  --wait \
+  2>&1
+```
+
+Set the Bash tool's `timeout` parameter to `300000` (5 minutes). Check for `[P1]` markers
+or `"verdict": "needs-attention"` in the output: found → `GATE: FAIL`, not found → `GATE: PASS`.
+
+If GATE is FAIL, use AskUserQuestion:
+```
+Codex found N critical issues in the diff.
+
+A) Investigate and fix now (recommended)
+B) Continue — review will still complete
+```
+
+If A: address the findings. Re-run `codex review` to verify.
+
+**IMPORTANT — parallel execution:** Launch Pass 1 (Claude subagent) AND Pass 2 (Codex
+adversarial) AND Pass 3 (Codex review, if applicable) ALL in the SAME message using
+multiple Agent tool calls or Bash tool calls. Do NOT wait for one to finish before
+starting the next. The whole point is speed through parallelism.
+
+If any pass fails or times out: note it and continue with the passes that succeeded.
+Adversarial review is a quality enhancement, not a gate.
+
+---
+
+### Error handling (all passes)
+
+All errors are non-blocking:
+- **Auth failure** (stderr contains "auth", "login", "unauthorized"): "Codex auth failed. Run `codex login` to authenticate."
+- **Timeout:** "Pass N timed out after 5 minutes."
+- **Empty response:** "Pass N returned no response."
+- **Codex not available:** "Codex CLI not found — running Claude adversarial only. Install Codex for cross-model coverage: `npm install -g @openai/codex`"
+
+---
+
+### Cross-model synthesis
+
+After ALL parallel passes complete, synthesize findings across all sources:
+
+```
+ADVERSARIAL REVIEW SYNTHESIS (N lines changed):
+════════════════════════════════════════════════════════════
+  High confidence (found by 2+ passes): [findings agreed on by multiple passes]
+  Unique to Claude adversarial: [from Pass 1]
+  Unique to Codex adversarial: [from Pass 2]
+  Unique to Codex structured review: [from Pass 3, if ran]
+  Passes used: Claude adversarial ✓  Codex adversarial ✓/✗  Codex review ✓/✗
+  Gate: PASS/FAIL/skipped
+════════════════════════════════════════════════════════════
+```
+
+High-confidence findings (agreed on by multiple passes) get prioritized for fixes.
+**FIXABLE findings** from any pass flow into the Fix-First pipeline. **INVESTIGATE
+findings** are presented as informational.
+
+### Persist the adversarial review result
+
+```bash
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"adversarial-review","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","status":"STATUS","source":"SOURCE","tier":"always","gate":"GATE","commit":"'"$(git rev-parse --short HEAD)"'"}'
+```
+Substitute: STATUS = "clean" if no findings across ALL passes, "issues_found" if any pass found issues. SOURCE = "all" if all 3 ran, "claude+codex-adv" if 2 ran, "claude" if only Claude subagent ran. GATE = Codex structured review gate result ("pass"/"fail"), "skipped" if diff < 200, or "informational" if Codex was unavailable.
+
+---
 
 ## Step 5.8: Persist Eng Review result
 
