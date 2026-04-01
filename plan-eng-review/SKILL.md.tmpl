@@ -69,7 +69,7 @@ When evaluating architecture, think "boring by default." When reviewing tests, t
 ### Design Doc Check
 ```bash
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-SLUG=$(~/.claude/skills/gstack/browse/bin/remote-slug 2>/dev/null || basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
+SLUG=$(~/.claude/skills/vstack/browse/bin/remote-slug 2>/dev/null || ~/.claude/skills/gstack/browse/bin/remote-slug 2>/dev/null || basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' || echo 'no-branch')
 DESIGN=$(ls -t ~/.gstack/projects/$SLUG/*-$BRANCH-design-*.md 2>/dev/null | head -1)
 [ -z "$DESIGN" ] && DESIGN=$(ls -t ~/.gstack/projects/$SLUG/*-design-*.md 2>/dev/null | head -1)
@@ -155,15 +155,267 @@ Evaluate:
 
 **STOP.** For each issue found in this section, call AskUserQuestion individually. One issue per call. Present options, state your recommendation, explain WHY. Do NOT batch multiple issues into one AskUserQuestion. Only proceed to the next section after ALL issues in this section are resolved.
 
-{{CODEX_PLAN_REVIEW}}
+## Opus+Codex Dispatch System (mandatory)
 
-### Outside Voice Integration Rule
+After all review sections are complete, enter the Opus+Codex dispatch loop. This is NOT
+optional. Every completed task from the plan gets classified and routed to the appropriate
+execution model. Opus (you) orchestrates; Codex does the heavy lifting on backend/infra.
 
-Outside voice findings are INFORMATIONAL until the user explicitly approves each one.
-Do NOT incorporate outside voice recommendations into the plan without presenting each
-finding via AskUserQuestion and getting explicit approval. This applies even when you
-agree with the outside voice. Cross-model consensus is a strong signal — present it as
-such — but the user makes the decision.
+### Step D1: Check Codex availability
+
+```bash
+CODEX_BIN=$(which codex 2>/dev/null || echo "")
+[ -z "$CODEX_BIN" ] && echo "CODEX_NOT_FOUND" || echo "CODEX_READY: $CODEX_BIN"
+```
+
+If `CODEX_NOT_FOUND`: warn the user and offer to install (`npm install -g @openai/codex`).
+Do NOT proceed with the dispatch loop without Codex — it is required for backend/infra work.
+
+### Step D2: Classify every task in the plan
+
+For each implementation task identified during the review, classify it:
+
+| Category | Signal patterns | Routes to |
+|----------|----------------|-----------|
+| **Backend/Infra** | DB migrations, API endpoints, tRPC routers, services, Drizzle schema, control-plane, host-agent, cloud-protocol, DevOps, CI/CD, Dockerfile, terraform | **Codex** |
+| **UI/Frontend** | React components, TailwindCSS, shadcn/ui, animations, layouts, pages, hooks consuming UI state, pane-layout, Electron renderer | **Claude Opus subagents** |
+| **Mixed** | Touches both backend + frontend (e.g., tRPC router + React hook + component) | **Split** into sub-tasks, route each part independently |
+| **E2E Testing** | Integration tests, browser tests, visual regression, user flow verification | **E2E Testing Router** (Step D6) |
+
+Present the classification table to the user via AskUserQuestion:
+
+> "Here's how I'd route each task. Confirm or override:"
+>
+> | Task | Category | Routed to |
+> | ... | ... | ... |
+
+Options:
+- A) Approve routing (recommended)
+- B) I want to override some routes
+- C) Route everything through Opus only (skip Codex)
+
+### Step D3: Codex Execution — Backend/Infra Tasks
+
+For each task classified as **Backend/Infra**, dispatch to Codex via the codex-companion
+runtime using maximum reasoning effort.
+
+**Codex invocation (non-negotiable settings):**
+
+```bash
+CODEX_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/  2>/dev/null | tail -1)}"
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+TMPERR_DISPATCH=$(mktemp /tmp/codex-dispatch-XXXXXXXX)
+
+codex -c model_reasoning_effort="xhigh" \
+  --ask-for-approval never \
+  --sandbox danger-full-access \
+  -c model_reasoning_summary="detailed" \
+  -c model_supports_reasoning_summaries=true \
+  -C "$_REPO_ROOT" \
+  "<TASK_PROMPT>" \
+  2>"$TMPERR_DISPATCH"
+```
+
+Set the Bash tool's `timeout` parameter to `600000` (10 minutes) for xhigh reasoning.
+
+**Task prompt construction** (follow gpt-5-4-prompting patterns):
+
+```xml
+<task>
+IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/.
+Stay focused on repository code only.
+
+[Specific task description from the plan]
+
+Architecture decisions from review:
+[Decisions made during sections 1-4]
+
+Constraints:
+[Project patterns from AGENTS.md, engineering preferences]
+</task>
+<verification_loop>
+After implementation, verify: types compile, tests pass, no lint errors.
+Run the relevant test suite before declaring done.
+</verification_loop>
+```
+
+**Present Codex output verbatim:**
+
+```
+CODEX EXECUTION (backend/infra — task N):
+════════════════════════════════════════════════════════════
+<full codex output, verbatim — do not truncate or summarize>
+════════════════════════════════════════════════════════════
+```
+
+Run backend/infra tasks sequentially through Codex — each task may depend on the
+previous one's output.
+
+### Step D4: Opus Execution — UI/Frontend Tasks
+
+For each task classified as **UI/Frontend**, dispatch via the Agent tool using Claude
+subagents. Opus stays in the orchestrator seat.
+
+```
+Agent tool call:
+  subagent_type: "general-purpose"
+  description: "<short task description>"
+  prompt: |
+    You are implementing a UI task as part of a reviewed plan.
+
+    TASK: <task description>
+
+    ARCHITECTURE DECISIONS:
+    <relevant decisions from sections 1-4>
+
+    CONSTRAINTS:
+    - Use React + TailwindCSS v4 + shadcn/ui
+    - Follow co-location project structure from AGENTS.md
+    - One component per file, ComponentName/ComponentName.tsx pattern
+    - Type safety — avoid `any`
+
+    Implement this task completely. Write all necessary code.
+```
+
+Launch UI subagents in parallel where tasks are independent (no shared state/components).
+Use `isolation: "worktree"` for tasks that touch different module directories.
+
+### Step D5: Convergence Loop — Opus Reviews Codex Output
+
+**This is the critical loop.** After each Codex execution (Step D3), Opus reviews the output.
+
+```
+┌─────────────────────────────────────────────────┐
+│                CONVERGENCE LOOP                  │
+│                                                  │
+│  Codex executes task (xhigh reasoning)           │
+│       ↓                                          │
+│  Opus reviews output                             │
+│       ↓                                          │
+│  ┌─ Opus agrees? ──┐                             │
+│  │  YES → Accept    │  NO → Opus sends feedback  │
+│  │  Move to next    │       to Codex, re-execute │
+│  │  task            │       Loop again           │
+│  └──────────────────┘                             │
+│                                                  │
+│  Max iterations: 3 per task                      │
+│  If no convergence after 3: escalate to user     │
+└─────────────────────────────────────────────────┘
+```
+
+**Opus review criteria for Codex output:**
+1. Does it satisfy the architecture decisions from the review?
+2. Does it follow the project's coding patterns (from AGENTS.md)?
+3. Is it type-safe, DRY, and handles edge cases?
+4. Does it match the engineering preferences stated above?
+5. Would this pass the performance review criteria from Section 4?
+
+**If Opus disagrees:** Re-dispatch to Codex with specific feedback:
+
+```bash
+codex -c model_reasoning_effort="xhigh" \
+  --ask-for-approval never \
+  --sandbox danger-full-access \
+  -c model_reasoning_summary="detailed" \
+  -c model_supports_reasoning_summaries=true \
+  -C "$_REPO_ROOT" \
+  "IMPORTANT: Do NOT read files under ~/.claude/ or .claude/skills/.
+
+  PREVIOUS ATTEMPT FEEDBACK:
+  <specific issues Opus identified>
+
+  REQUIRED CHANGES:
+  <what needs to change and why>
+
+  Original task: <task description>" \
+  2>"$TMPERR_DISPATCH"
+```
+
+**If convergence after N iterations:** Present the accepted output:
+
+```
+CONVERGED (iteration N/3):
+════════════════════════════════════════════════════════════
+<final accepted output>
+════════════════════════════════════════════════════════════
+Opus review: APPROVED — <one-line reason>
+```
+
+**If no convergence after 3 iterations:** Escalate to user via AskUserQuestion:
+
+> "Opus and Codex could not converge on task [X] after 3 iterations.
+> Opus's concern: [specific issue]
+> Codex's position: [what Codex keeps producing]"
+>
+> A) Accept Codex's latest output (override Opus)
+> B) Accept Opus's position (rewrite via Opus subagent)
+> C) Investigate further — show me the full diff between iterations
+
+### Step D6: E2E Testing Router
+
+After all tasks are executed, determine the appropriate e2e testing strategy.
+
+**Decision tree:**
+
+```
+┌─────────────────────────────────────────────────┐
+│           E2E TESTING DECISION TREE              │
+│                                                  │
+│  Is the app a web application?                   │
+│  ├── YES: Is there a running dev server?         │
+│  │   ├── YES: Use BROWSER MCP (browse skill)     │
+│  │   └── NO: Start dev server, then Browser MCP  │
+│  └── NO: Is it a desktop/native app?             │
+│      ├── YES: Use COMPUTER-USE MCP               │
+│      └── NO: Use unit/integration tests only     │
+│                                                  │
+│  Does the test need native UI interaction?       │
+│  ├── YES: Use COMPUTER-USE MCP                   │
+│  └── NO: Use BROWSER MCP                         │
+│                                                  │
+│  Is it an Electron app?                          │
+│  ├── Renderer (web content): BROWSER MCP         │
+│  └── Native chrome/menus: COMPUTER-USE MCP       │
+└─────────────────────────────────────────────────┘
+```
+
+**Browser MCP testing** (web apps, Electron renderer):
+Use the `/browse` skill to navigate to the running app, interact with elements, take
+screenshots, and verify state. Faster and more reliable for web content.
+
+**Computer-use MCP testing** (native apps, desktop UI, cross-app workflows):
+Use `mcp__computer-use__*` tools to take screenshots, click, type, and verify native
+UI state. Call `mcp__computer-use__request_access` first for each application needed.
+
+**Hybrid testing** (Electron apps with both web and native UI):
+Use Browser MCP for renderer content, Computer-use MCP for native chrome and menus.
+Run both in sequence.
+
+Present the testing plan via AskUserQuestion:
+
+> "E2E testing strategy for the implemented changes:"
+>
+> | Component | Test method | What to verify |
+> | ... | ... | ... |
+
+Options:
+- A) Execute e2e tests now (recommended)
+- B) Skip e2e — unit tests are sufficient
+- C) I'll test manually
+
+**If A:** Execute the tests. For each failure, dispatch a fix through the appropriate
+model (Codex for backend failures, Opus subagent for UI failures) and re-test. Loop
+until all tests pass or escalate to user after 2 failed fix attempts.
+
+### Cross-Model Integration Rule
+
+All Codex outputs are subject to Opus review via the convergence loop before acceptance.
+All Opus UI subagent outputs are presented to the user for visual confirmation when
+screenshots are available. Cross-model consensus (Opus + Codex agree) is the strongest
+signal. Cross-model disagreement triggers the convergence loop — never silent acceptance.
+
+Do NOT auto-incorporate any model's output without running it through the convergence
+loop first. The user can override at any escalation point.
 
 ## CRITICAL RULE — How to ask questions
 Follow the AskUserQuestion format from the Preamble above. Additional rules for plan reviews:
@@ -247,7 +499,9 @@ At the end of the review, fill in and display this summary so the user can see a
 - What already exists: written
 - TODOS.md updates: ___ items proposed to user
 - Failure modes: ___ critical gaps flagged
-- Outside voice: ran (codex/claude) / skipped
+- Opus+Codex dispatch: ___ tasks classified (___ backend→Codex, ___ UI→Opus, ___ mixed→split)
+- Convergence loop: ___ tasks converged, ___ escalated to user
+- E2E testing: ___ (browser MCP / computer-use / hybrid / skipped)
 - Parallelization: ___ lanes, ___ parallel / ___ sequential
 - Lake Score: X/Y recommendations chose complete option
 
@@ -271,7 +525,7 @@ the same pattern. The review dashboard depends on this data. Skipping this
 command breaks the review readiness dashboard in /ship.
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-eng-review","timestamp":"TIMESTAMP","status":"STATUS","unresolved":N,"critical_gaps":N,"issues_found":N,"mode":"MODE","commit":"COMMIT"}'
+$([ -d ~/.claude/skills/vstack ] && echo ~/.claude/skills/vstack || echo ~/.claude/skills/gstack)/bin/gstack-review-log '{"skill":"plan-eng-review","timestamp":"TIMESTAMP","status":"STATUS","unresolved":N,"critical_gaps":N,"issues_found":N,"mode":"MODE","commit":"COMMIT"}'
 ```
 
 Substitute values from the Completion Summary:
