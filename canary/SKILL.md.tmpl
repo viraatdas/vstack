@@ -131,6 +131,12 @@ $B console --errors
 $B perf
 ```
 
+**Parallel Page Monitoring:** When monitoring 3+ pages, check them in parallel:
+- Launch one Agent subagent per page
+- Each agent: `$B goto <url>`, `$B screenshot`, `$B console --errors`, `$B perf`
+- Collect all results before comparing against baselines
+- This reduces N-page monitoring time from O(N) to O(1)
+
 After each check, compare results against the baseline (or pre-deploy snapshot):
 
 1. **Page load failure** — `goto` returns error or timeout → CRITICAL ALERT

@@ -168,13 +168,50 @@ Show the user: "Here's the current state (screenshot) and here's what it should 
 
 This step is optional — skip for trivial CSS fixes (wrong hex color, missing padding value). Use it for findings where the intended design isn't obvious from the description alone.
 
+### 8a.6. Parallel Mockup Generation (if DESIGN_READY and 3+ findings need mockups)
+
+When three or more findings in the triage list require target mockups (visual layout, hierarchy, or spacing issues — not trivial CSS value fixes), generate all mockups in parallel instead of one-by-one during each fix iteration:
+
+- **Launch one Agent subagent per finding** that needs a mockup. Each agent receives:
+  - The finding number and description
+  - The DESIGN.md constraints (if present)
+  - The output path: `$REPORT_DIR/screenshots/finding-NNN-target.png`
+- **Each agent independently runs:**
+  ```bash
+  $D generate --brief "<description of the page/component with finding NNN fixed, referencing DESIGN.md constraints>" --output "$REPORT_DIR/screenshots/finding-NNN-target.png"
+  ```
+- **Collect all mockups before proceeding to the fix loop.** Wait for every subagent to complete. If any mockup generation fails, log the failure and continue — that finding will proceed without a target mockup in the fix loop.
+
+This parallelization saves significant wall-clock time when the audit surfaces many visual findings. The fix loop (8b onward) then references the pre-generated mockups instead of generating them inline.
+
 ### 8b. Fix
 
 - Read the source code, understand the context
 - Make the **minimal fix** — smallest change that resolves the design issue
-- If a target mockup was generated in 8a.5, use it as the visual reference for the fix
+- If a target mockup was generated in 8a.5 or 8a.6, use it as the visual reference for the fix
 - CSS-only changes are preferred (safer, more reversible)
 - Do NOT refactor surrounding code, add features, or "improve" unrelated things
+
+#### 8b.1. Parallel CSS Fixes
+
+When multiple CSS-only fixes touch **different components** (no overlapping files), they can be applied in parallel via Agent subagents:
+
+- Each subagent handles one finding: reads the source, applies the minimal CSS change, and stages only its changed files.
+- Only eligible for pure CSS/styling fixes where the changed files are disjoint. If two findings touch the same file, they must be applied sequentially.
+- After all parallel subagents complete, commit each fix individually in finding-number order (one commit per fix, per 8c).
+
+#### 8b.2. Codex Adversarial Review for Complex Layout Refactors
+
+For findings that require **component restructuring beyond CSS** (e.g., reordering DOM hierarchy, splitting/merging components, changing layout primitives like flex-to-grid), dispatch to Codex adversarial-review before committing:
+
+```bash
+CODEX_PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | tail -1)
+node "$CODEX_PLUGIN_ROOT/scripts/codex-companion.mjs" adversarial-review --base <base> --wait
+```
+
+- Run this **after applying the fix but before `git commit`**. The adversarial review checks for regressions, accessibility breakage, and unintended side effects in the structural change.
+- If the review passes: proceed to commit (8c).
+- If the review flags issues: address the feedback, re-apply, and re-run the adversarial review. If it fails twice, mark the finding as "deferred" and revert.
 
 ### 8c. Commit
 

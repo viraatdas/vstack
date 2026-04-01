@@ -95,6 +95,11 @@ Network summary:
 $B eval "(() => { const r = performance.getEntriesByType('resource'); return JSON.stringify({total_requests: r.length, total_transfer: r.reduce((s,e) => s + (e.transferSize||0), 0), by_type: Object.entries(r.reduce((a,e) => { a[e.initiatorType] = (a[e.initiatorType]||0) + 1; return a; }, {})).sort((a,b) => b[1]-a[1])})})()"
 ```
 
+**Parallel Benchmark Collection:** When benchmarking 3+ pages:
+- Launch one Agent subagent per page to collect Core Web Vitals independently
+- Each agent: `$B goto <url>`, `$B perf`, `$B eval` for its page
+- Collect all metrics before comparison/regression analysis
+
 ### Phase 4: Baseline Capture (--baseline mode)
 
 Save metrics to baseline file:

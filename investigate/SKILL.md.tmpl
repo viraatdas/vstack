@@ -135,6 +135,24 @@ Before writing ANY fix, verify your hypothesis.
    C) Add logging and wait — instrument the area and catch it next time
    ```
 
+4. **Parallel Hypothesis Testing:** When 2-3 candidate hypotheses exist and they can be tested independently (no shared mutable state):
+   - Launch one Agent per hypothesis using `isolation: "worktree"` for safe parallel testing
+   - Each agent: adds instrumentation/logging for its hypothesis, runs the repro steps, collects evidence
+   - Collect all evidence before evaluating which hypothesis is correct
+   - If hypotheses require mutating shared state, test sequentially instead
+
+5. **Codex consultation for complex investigations:** When the root cause is unclear after hypothesis testing, consult Codex:
+   ```bash
+   CODEX_PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | tail -1)
+   codex -c model_reasoning_effort="xhigh" \
+     --ask-for-approval never \
+     --sandbox danger-full-access \
+     -c model_reasoning_summary="detailed" \
+     -c model_supports_reasoning_summaries=true \
+     -C "$_REPO_ROOT" \
+     "Investigate this bug: <symptoms>. Evidence collected: <evidence from hypotheses>. What is the root cause?"
+   ```
+
 **Red flags** — if you see any of these, slow down:
 - "Quick fix for now" — there is no "for now." Fix it right or escalate.
 - Proposing a fix before tracing data flow — you're guessing.

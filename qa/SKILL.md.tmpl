@@ -146,6 +146,26 @@ Mark issues that cannot be fixed from source code (e.g., third-party widget bugs
 
 ## Phase 8: Fix Loop
 
+**Parallel Fix Strategy:** When multiple bugs are found in DIFFERENT files/components:
+- Group bugs by file/component they touch
+- Bugs in different files can be fixed in parallel using Agent subagents
+- Launch one Agent per independent bug group (use `isolation: "worktree"` for safety)
+- Each agent: reads the code, writes the fix, runs the relevant test
+- Collect all results, verify no conflicts, then commit sequentially
+
+For complex multi-file fixes (touching 3+ files or requiring architectural changes):
+```bash
+CODEX_PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | tail -1)
+codex -c model_reasoning_effort="xhigh" \
+  --ask-for-approval never \
+  --sandbox danger-full-access \
+  -c model_reasoning_summary="detailed" \
+  -c model_supports_reasoning_summaries=true \
+  -C "$_REPO_ROOT" \
+  "<fix prompt with bug description and affected files>"
+```
+Review Codex's fix via the convergence pattern before committing.
+
 For each fixable issue, in severity order:
 
 ### 8a. Locate source
@@ -231,6 +251,8 @@ Test type decision:
 - Pure CSS → skip (caught by QA reruns)
 
 Generate unit tests. Mock all external dependencies (DB, API, Redis, file system).
+
+Generate regression tests in parallel -- one Agent per test when tests are independent.
 
 Use auto-incrementing names to avoid collisions: check existing `{name}.regression-*.test.{ext}` files, take max number + 1.
 
