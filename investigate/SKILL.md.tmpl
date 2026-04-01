@@ -45,25 +45,58 @@ Fixing symptoms creates whack-a-mole debugging. Every fix that doesn't address r
 
 ---
 
-## Phase 1: Root Cause Investigation
+## Phase 1: Root Cause Investigation (Opus + Codex parallel)
 
-Gather context before forming any hypothesis.
+Gather context before forming any hypothesis. **Dispatch Codex immediately** as the
+primary investigator while Opus collects context in parallel.
 
 1. **Collect symptoms:** Read the error messages, stack traces, and reproduction steps. If the user hasn't provided enough context, ask ONE question at a time via AskUserQuestion.
 
-2. **Read the code:** Trace the code path from the symptom back to potential causes. Use Grep to find all references, Read to understand the logic.
+2. **PARALLEL LAUNCH — Opus context gathering + Codex deep investigation:**
 
-3. **Check recent changes:**
+   Launch BOTH in the SAME message:
+
+   **Opus (you):** Read the code, trace the code path from symptom to potential causes.
+   Use Grep to find all references, Read to understand the logic. Check recent changes:
    ```bash
    git log --oneline -20 -- <affected-files>
    ```
-   Was this working before? What changed? A regression means the root cause is in the diff.
 
-4. **Reproduce:** Can you trigger the bug deterministically? If not, gather more evidence before proceeding.
+   **Codex (via Bash, runs in parallel):**
+   ```bash
+   _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+   codex -c model_reasoning_effort="xhigh" \
+     --ask-for-approval never \
+     --sandbox danger-full-access \
+     -c model_reasoning_summary="detailed" \
+     -c model_supports_reasoning_summaries=true \
+     -C "$_REPO_ROOT" \
+     "IMPORTANT: Do NOT read files under ~/.claude/ or .claude/skills/.
+
+     Investigate this bug. Symptoms: <symptoms and error messages>.
+     Affected files: <file paths>.
+
+     1. Trace the code path from the error back to the root cause
+     2. Check git log for recent changes to affected files
+     3. Look for race conditions, nil propagation, state corruption, config drift
+     4. Form a specific, testable root cause hypothesis
+     5. If possible, add a temporary assertion or log to verify the hypothesis
+     6. Run any relevant tests to confirm
+
+     Output your root cause hypothesis with evidence."
+   ```
+   Timeout: 600000 (10 minutes for xhigh reasoning)
+
+3. **Reproduce:** Can you trigger the bug deterministically? If not, gather more evidence before proceeding.
 
 {{LEARNINGS_SEARCH}}
 
+4. **Synthesize:** Compare Opus's code tracing with Codex's investigation. If both
+   converge on the same root cause → high confidence. If they disagree → test both
+   hypotheses in Phase 3.
+
 Output: **"Root cause hypothesis: ..."** — a specific, testable claim about what is wrong and why.
+If Opus and Codex disagree, present both: **"Hypothesis A (Opus): ... | Hypothesis B (Codex): ..."**
 
 ---
 
@@ -117,41 +150,90 @@ If WebSearch is unavailable, skip this search and proceed with hypothesis testin
 
 ---
 
-## Phase 3: Hypothesis Testing
+## Phase 3: Hypothesis Testing (Codex-primary)
 
-Before writing ANY fix, verify your hypothesis.
+Before writing ANY fix, verify your hypothesis. **Codex is the primary tester** —
+it has full sandbox access and can instrument, run, and verify independently.
 
-1. **Confirm the hypothesis:** Add a temporary log statement, assertion, or debug output at the suspected root cause. Run the reproduction. Does the evidence match?
+1. **Dispatch Codex to verify the hypothesis:**
 
-2. **If the hypothesis is wrong:** Before forming the next hypothesis, consider searching for the error. **Sanitize first** — strip hostnames, IPs, file paths, SQL fragments, customer identifiers, and any internal/proprietary data from the error message. Search only the generic error type and framework context: "{component} {sanitized error type} {framework version}". If the error message is too specific to sanitize safely, skip the search. If WebSearch is unavailable, skip and proceed. Then return to Phase 1. Gather more evidence. Do not guess.
-
-3. **3-strike rule:** If 3 hypotheses fail, **STOP**. Use AskUserQuestion:
-   ```
-   3 hypotheses tested, none match. This may be an architectural issue
-   rather than a simple bug.
-
-   A) Continue investigating — I have a new hypothesis: [describe]
-   B) Escalate for human review — this needs someone who knows the system
-   C) Add logging and wait — instrument the area and catch it next time
-   ```
-
-4. **Parallel Hypothesis Testing:** When 2-3 candidate hypotheses exist and they can be tested independently (no shared mutable state):
-   - Launch one Agent per hypothesis using `isolation: "worktree"` for safe parallel testing
-   - Each agent: adds instrumentation/logging for its hypothesis, runs the repro steps, collects evidence
-   - Collect all evidence before evaluating which hypothesis is correct
-   - If hypotheses require mutating shared state, test sequentially instead
-
-5. **Codex consultation for complex investigations:** When the root cause is unclear after hypothesis testing, consult Codex:
    ```bash
-   CODEX_PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | tail -1)
+   _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
    codex -c model_reasoning_effort="xhigh" \
      --ask-for-approval never \
      --sandbox danger-full-access \
      -c model_reasoning_summary="detailed" \
      -c model_supports_reasoning_summaries=true \
      -C "$_REPO_ROOT" \
-     "Investigate this bug: <symptoms>. Evidence collected: <evidence from hypotheses>. What is the root cause?"
+     "IMPORTANT: Do NOT read files under ~/.claude/ or .claude/skills/.
+
+     ROOT CAUSE HYPOTHESIS: <hypothesis from Phase 1>
+
+     Your job:
+     1. Add a temporary log/assertion at the suspected root cause
+     2. Run the reproduction steps: <repro steps>
+     3. Check if the evidence matches the hypothesis
+     4. If it matches: confirm with a second verification (different angle)
+     5. If it doesn't match: form a NEW hypothesis based on what you observed
+        and test that one too
+     6. Report: CONFIRMED or REJECTED, with evidence
+
+     You have full write access. Instrument the code, run tests, check logs."
    ```
+   Timeout: 600000 (10 minutes)
+
+   While Codex tests, Opus independently adds its own log/assertion and runs the
+   reproduction as a parallel verification.
+
+2. **If the hypothesis is wrong:** Codex will have already formed and tested a follow-up
+   hypothesis. If Codex also couldn't confirm, search for the error externally.
+   **Sanitize first** — strip hostnames, IPs, file paths, SQL fragments, customer data.
+   Search: "{component} {sanitized error type} {framework version}".
+   Then return to Phase 1 with new evidence. Do not guess.
+
+3. **3-strike rule:** If 3 hypotheses fail (across both Opus and Codex), **STOP**.
+   Use AskUserQuestion:
+   ```
+   3 hypotheses tested by both Opus and Codex, none confirmed.
+   This may be an architectural issue rather than a simple bug.
+
+   A) Let Codex do a deep codebase scan (xhigh, full access, 10 min)
+   B) Escalate for human review — this needs someone who knows the system
+   C) Add logging and wait — instrument the area and catch it next time
+   ```
+
+   **If A:** Dispatch Codex with a broader scope:
+   ```bash
+   codex -c model_reasoning_effort="xhigh" \
+     --ask-for-approval never \
+     --sandbox danger-full-access \
+     -c model_reasoning_summary="detailed" \
+     -c model_supports_reasoning_summaries=true \
+     -C "$_REPO_ROOT" \
+     "IMPORTANT: Do NOT read files under ~/.claude/ or .claude/skills/.
+
+     Deep investigation. 3 hypotheses failed:
+     1. <hypothesis 1> — REJECTED because <evidence>
+     2. <hypothesis 2> — REJECTED because <evidence>
+     3. <hypothesis 3> — REJECTED because <evidence>
+
+     Symptoms: <original symptoms>
+
+     Do a full codebase scan. Look at:
+     - All callers and callees of the affected functions
+     - Database queries and migrations related to the affected data
+     - Configuration files, env vars, feature flags
+     - Race conditions in concurrent/async code paths
+     - Recent changes across the entire repo (not just affected files)
+     Find what we missed."
+   ```
+
+4. **Parallel Hypothesis Testing:** When 2-3 candidate hypotheses exist and they can
+   be tested independently:
+   - Launch one Agent per hypothesis using `isolation: "worktree"` for safe parallel testing
+   - ALSO dispatch Codex on the most likely hypothesis simultaneously
+   - Codex has full sandbox access and can make changes to test; Opus agents use worktrees
+   - Collect all evidence before evaluating which hypothesis is correct
 
 **Red flags** — if you see any of these, slow down:
 - "Quick fix for now" — there is no "for now." Fix it right or escalate.
@@ -160,17 +242,44 @@ Before writing ANY fix, verify your hypothesis.
 
 ---
 
-## Phase 4: Implementation
+## Phase 4: Implementation (Codex executes, Opus reviews)
 
-Once root cause is confirmed:
+Once root cause is confirmed, **dispatch Codex to implement the fix** while Opus
+reviews the approach.
 
-1. **Fix the root cause, not the symptom.** The smallest change that eliminates the actual problem.
+1. **Codex implements the fix:**
 
-2. **Minimal diff:** Fewest files touched, fewest lines changed. Resist the urge to refactor adjacent code.
+   ```bash
+   _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+   codex -c model_reasoning_effort="xhigh" \
+     --ask-for-approval never \
+     --sandbox danger-full-access \
+     -c model_reasoning_summary="detailed" \
+     -c model_supports_reasoning_summaries=true \
+     -C "$_REPO_ROOT" \
+     "IMPORTANT: Do NOT read files under ~/.claude/ or .claude/skills/.
 
-3. **Write a regression test** that:
-   - **Fails** without the fix (proves the test is meaningful)
-   - **Passes** with the fix (proves the fix works)
+     ROOT CAUSE (confirmed): <root cause with evidence>
+
+     Fix this bug:
+     1. Fix the root cause, not the symptom. Smallest change possible.
+     2. Minimal diff — fewest files, fewest lines. No refactoring.
+     3. Write a regression test that FAILS without the fix and PASSES with it.
+     4. Run the full test suite. No regressions allowed.
+     5. Remove any temporary debug instrumentation from Phase 3."
+   ```
+   Timeout: 600000 (10 minutes)
+
+2. **Opus reviews Codex's fix** (convergence check):
+   - Does it fix the root cause, not just the symptom?
+   - Is the diff minimal?
+   - Does the regression test actually prove the fix?
+   - Did the full test suite pass?
+
+   If Opus disagrees, re-dispatch to Codex with specific feedback (max 2 iterations).
+   If still no convergence, Opus implements the fix directly.
+
+3. **Minimal diff:** Fewest files touched, fewest lines changed. Resist the urge to refactor adjacent code.
 
 4. **Run the full test suite.** Paste the output. No regressions allowed.
 
